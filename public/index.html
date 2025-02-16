@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ICONOCLAST Dashboard & DAPP</title>
+  <!-- Socket.IO for real-time updates -->
+  <script src="/socket.io/socket.io.js"></script>
+  <!-- Ethers.js for Web3 interactions -->
+  <script src="https://cdn.jsdelivr.net/npm/ethers/dist/ethers.min.js"></script>
+  <!-- TFHE library for encryption -->
+  <script src="https://unpkg.com/tfhe"></script>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <h1>ICONOCLAST Dashboard & DAPP</h1>
+  <div class="columns">
+    <!-- Left Column: Developer Application -->
+    <div class="left-column">
+      <div id="developerSection">
+        <h2>Developer Application</h2>
+        <form id="developerForm" enctype="multipart/form-data">
+          <label for="devName">Name:</label>
+          <input type="text" id="devName" name="devName" required />
+
+          <label for="devEmail">Email:</label>
+          <input type="email" id="devEmail" name="devEmail" required />
+
+          <label for="devProject">Project Name:</label>
+          <input type="text" id="devProject" name="devProject" required />
+
+          <label for="devDescription">Project Description:</label>
+          <textarea id="devDescription" name="devDescription" required></textarea>
+
+          <label for="totalApplication">Total Application (to be encrypted):</label>
+          <input type="number" id="totalApplication" name="totalApplication" required />
+
+          <!-- Data Privacy Option -->
+          <label for="dataPrivacy">Data Privacy:</label>
+          <div id="dataPrivacy">
+            <input type="radio" id="encryptData" name="dataPrivacy" value="encrypt" checked />
+            <label for="encryptData">Encrypt Data</label>
+            <input type="radio" id="publicData" name="dataPrivacy" value="public" />
+            <label for="publicData">Make Data Public</label>
+          </div>
+
+          <label for="settlementModeInput">Settlement Mode:</label>
+          <select id="settlementModeInput" name="settlementModeInput" required>
+            <option value="ethereum">Ethereum</option>
+            <option value="bitcoin">Bitcoin</option>
+            <option value="both" selected>Both</option>
+          </select>
+
+          <label for="recipientAddress">Recipient Address:</label>
+          <input type="text" id="recipientAddress" name="recipientAddress" required />
+
+          <label for="appFiles">Upload Application Directory:</label>
+          <input type="file" id="appFiles" name="appFiles" webkitdirectory directory multiple required />
+
+          <button type="submit">Submit Application</button>
+        </form>
+      </div>
+    </div>
+
+    <!-- Right Column: Dashboard, Staking, Governance, Token & Events -->
+    <div class="right-column">
+      <!-- Transaction Dashboard -->
+      <div id="dashboardSection">
+        <h2>Transaction Dashboard</h2>
+        <p id="settlementMode">Settlement Mode: Loading...</p>
+        <p id="batchSize">Batch Size: Loading...</p>
+        <ul id="transactionList"></ul>
+        <button onclick="fetchDecryptedTransactions()">View Decrypted Transactions</button>
+        <ul id="decryptedTransactionList"></ul>
+      </div>
+
+      <!-- Staking Section -->
+      <div id="stakingSection">
+        <h2>Staking</h2>
+        <form id="stakeForm">
+          <label for="stakeAmount">Amount to Stake:</label>
+          <input type="number" id="stakeAmount" name="stakeAmount" required min="1" step="any" />
+          <button type="submit">Stake Tokens</button>
+        </form>
+        <button id="unstakeButton">Unstake Tokens</button>
+        <p id="stakedBalance">Your Staked Balance: Loading...</p>
+      </div>
+
+      <!-- Governance Section -->
+      <div id="governanceSection">
+        <h2>Governance</h2>
+        <form id="proposalForm">
+          <label for="proposalDescription">Proposal Description:</label>
+          <textarea id="proposalDescription" name="proposalDescription" required></textarea>
+          <button type="submit">Submit Proposal</button>
+        </form>
+        <div id="proposalsList">
+          <h3>Current Proposals</h3>
+          <div id="proposalContainer">Loading proposals...</div>
+        </div>
+      </div>
+
+      <!-- Token Interaction Section -->
+      <div id="tokenSection">
+        <h2>Token Interaction</h2>
+        <div id="tokenInfo">
+          <p id="tokenName">Token: Loading...</p>
+          <p id="tokenSymbol">Symbol: Loading...</p>
+          <p id="tokenBalance">Your Balance: Loading...</p>
+        </div>
+        <form id="transferForm">
+          <label for="transferRecipient">Recipient Address:</label>
+          <input type="text" id="transferRecipient" required />
+          <label for="transferAmount">Amount to Transfer:</label>
+          <input type="number" id="transferAmount" required />
+          <button type="submit">Transfer Tokens</button>
+        </form>
+      </div>
+
+      <!-- Events Log -->
+      <div class="section">
+        <h2>Events Log</h2>
+        <ul id="events"></ul>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const socket = io();
+    let fheKeySet;
+    // Replace these placeholders with your deployed contract addresses
+    const STAKING_ADDRESS = "<YOUR_STAKING_CONTRACT_ADDRESS>";
+    const GOVERNANCE_ADDRESS = "<YOUR_GOVERNANCE_CONTRACT_ADDRESS>";
+    const TOKEN_ADDRESS = "<YOUR_TOKEN_CONTRACT_ADDRESS>";
+
+    // ABIs for the contracts
+    const STAKING_ABI = [
+      "function stake(uint256 amount) external",
+      "function unstake() external",
+      "function stakes(address) view returns (uint256)"
+    ];
+    const GOVERNANCE_ABI = [
+      "function submitProposal(string calldata description) external",
+      "function voteOnProposal(uint256 proposalId) external",
+      "function proposalCount() view returns (uint256)",
+      "function proposals(uint256) view returns (string description, uint256 votes, bool executed)"
+    ];
+    const TOKEN_ABI = [
+      "function balanceOf(address owner) view returns (uint256)",
+      "function transfer(address recipient, uint256 amount) returns (bool)",
+      "function name() view returns (string)",
+      "function symbol() view returns (string)"
+    ];
+
+    let provider, signer, stakingContract, governanceContract, tokenContract;
+
+    // Initialize ethers and contract instances
+    async function initWeb3() {
+      if (!window.ethereum) {
+        alert("Please install MetaMask to use this DApp.");
+        return;
+      }
+      await window.ethereum.request({ method: 'eth_requestAccounts' });
+      provider = new ethers.providers.Web3Provider(window.ethereum);
+      signer = provider.getSigner();
+      stakingContract = new ethers.Contract(STAKING_ADDRESS, STAKING_ABI, signer);
+      governanceContract = new ethers.Contract(GOVERNANCE_ADDRESS, GOVERNANCE_ABI, signer);
+      tokenContract = new ethers.Contract(TOKEN_ADDRESS, TOKEN_ABI, signer);
+      updateTokenInfo();
+    }
+
+    // Initialize TFHE encryption key set
+    async function initializeFHE() {
+      fheKeySet = tfhe.newKeySet();
+    }
+
+    // Update transaction list from dashboard socket event
+    function updateTransactionList(transactions = []) {
+      const listEl = document.getElementById('transactionList');
+      listEl.innerHTML = "";
+      transactions.forEach(tx => {
+        const li = document.createElement("li");
+        li.innerText = JSON.stringify(tx);
+        listEl.appendChild(li);
+      });
+    }
+
+    // Fetch decrypted transactions via API
+    async function fetchDecryptedTransactions() {
+      try {
+        const response = await fetch("/api/decrypted-transactions");
+        const data = await response.json();
+        const listEl = document.getElementById("decryptedTransactionList");
+        listEl.innerHTML = "";
+        data.transactions.forEach(tx => {
+          const li = document.createElement("li");
+          li.innerText = JSON.stringify(tx);
+          listEl.appendChild(li);
+        });
+      } catch (error) {
+        addEvent(`Error fetching decrypted transactions: ${error.message}`);
+      }
+    }
+
+    // Add events to the log
+    function addEvent(message) {
+      const eventsEl = document.getElementById("events");
+      const li = document.createElement("li");
+      li.innerText = `[${new Date().toLocaleTimeString()}] ${message}`;
+      eventsEl.prepend(li);
+    }
+
+    // Developer form submission
+    document.getElementById("developerForm").addEventListener("submit", async (event) => {
+      event.preventDefault();
+
+      try {
+        const totalApplication = document.getElementById("totalApplication").value;
+        const dataPrivacyChoice = document.querySelector('input[name="dataPrivacy"]:checked').value;
+        
+        // Encrypt only if the developer chose to encrypt their data.
+        let processedTotalApplication = totalApplication;
+        if (dataPrivacyChoice === "encrypt") {
+          processedTotalApplication = tfhe.encrypt(fheKeySet, totalApplication);
+        }
+
+        const formData = new FormData();
+        formData.append("name", document.getElementById("devName").value);
+        formData.append("email", document.getElementById("devEmail").value);
+        formData.append("project", document.getElementById("devProject").value);
+        formData.append("description", document.getElementById("devDescription").value);
+        formData.append("totalApplication", processedTotalApplication);
+        formData.append("settlementMode", document.getElementById("settlementModeInput").value);
+        formData.append("recipient", document.getElementById("recipientAddress").value);
+        formData.append("dataPrivacy", dataPrivacyChoice);
+
+        const files = document.getElementById("appFiles").files;
+        for (let i = 0; i < files.length; i++) {
+          formData.append("appFiles", files[i]);
+        }
+
+        const response = await fetch("/api/developer-application", {
+          method: "POST",
+          body: formData,
+        });
+        const result = await response.json();
+        addEvent(`Developer Application Submitted: ${JSON.stringify(result)}`);
+      } catch (err) {
+        addEvent(`Error submitting application: ${err.message}`);
+      }
+    });
+
+    // Staking: Stake tokens
+    document.getElementById("stakeForm").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      try {
+        const amount = document.getElementById("stakeAmount").value;
+        if (!amount || Number(amount) <= 0) {
+          alert("Please enter a valid amount to stake.");
+          return;
+        }
+        addEvent("Submitting stake transaction...");
+        const tx = await stakingContract.stake(ethers.utils.parseUnits(amount.toString(), 18));
+        await tx.wait();
+        addEvent("Stake transaction confirmed.");
+        fetchStakedBalance();
+      } catch (error) {
+        addEvent(`Error staking tokens: ${error.message}`);
+      }
+    });
+
+    // Staking: Unstake tokens
+    document.getElementById("unstakeButton").addEventListener("click", async () => {
+      try {
+        addEvent("Submitting unstake transaction...");
+        const tx = await stakingContract.unstake();
+        await tx.wait();
+        addEvent("Unstake transaction confirmed.");
+        fetchStakedBalance();
+      } catch (error) {
+        addEvent(`Error unstaking tokens: ${error.message}`);
+      }
+    });
+
+    // Fetch the current staked balance of the user
+    async function fetchStakedBalance() {
+      try {
+        const address = await signer.getAddress();
+        const balance = await stakingContract.stakes(address);
+        document.getElementById("stakedBalance").innerText = 
+          `Your Staked Balance: ${ethers.utils.formatUnits(balance, 18)}`;
+      } catch (error) {
+        addEvent(`Error fetching staked balance: ${error.message}`);
+      }
+    }
+
+    // Governance: Submit proposal
+    document.getElementById("proposalForm").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      try {
+        const description = document.getElementById("proposalDescription").value;
+        if (!description) {
+          alert("Proposal description is required.");
+          return;
+        }
+        addEvent("Submitting proposal...");
+        const tx = await governanceContract.submitProposal(description);
+        await tx.wait();
+        addEvent("Proposal submitted successfully.");
+        fetchProposals();
+      } catch (error) {
+        addEvent(`Error submitting proposal: ${error.message}`);
+      }
+    });
+
+    // Governance: Vote on a proposal
+    async function voteOnProposal(proposalId) {
+      try {
+        addEvent(`Voting on proposal ${proposalId}...`);
+        const tx = await governanceContract.voteOnProposal(proposalId);
+        await tx.wait();
+        addEvent(`Voted on proposal ${proposalId} successfully.`);
+        fetchProposals();
+      } catch (error) {
+        addEvent(`Error voting on proposal ${proposalId}: ${error.message}`);
+      }
+    }
+
+    // Governance: Fetch proposals and update the UI
+    async function fetchProposals() {
+      try {
+        const proposalCount = await governanceContract.proposalCount();
+        let proposalsHtml = "";
+        for (let i = 0; i < proposalCount; i++) {
+          const proposal = await governanceContract.proposals(i);
+          proposalsHtml += `<div class="proposal">
+            <p><strong>ID:</strong> ${i}</p>
+            <p><strong>Description:</strong> ${proposal.description}</p>
+            <p><strong>Votes:</strong> ${proposal.votes.toString()}</p>
+            <p><strong>Status:</strong> ${proposal.executed ? "Executed" : "Active"}</p>
+            <button onclick="voteOnProposal(${i})" ${proposal.executed ? "disabled" : ""}>Vote</button>
+          </div>`;
+        }
+        document.getElementById("proposalContainer").innerHTML = proposalsHtml || "No proposals found.";
+      } catch (error) {
+        addEvent(`Error fetching proposals: ${error.message}`);
+        document.getElementById("proposalContainer").innerText = "Error loading proposals.";
+      }
+    }
+
+    // Token Interaction: Update token info (name, symbol, balance)
+    async function updateTokenInfo() {
+      try {
+        const address = await signer.getAddress();
+        const name = await tokenContract.name();
+        const symbol = await tokenContract.symbol();
+        const balance = await tokenContract.balanceOf(address);
+        document.getElementById("tokenName").innerText = `Token: ${name}`;
+        document.getElementById("tokenSymbol").innerText = `Symbol: ${symbol}`;
+        document.getElementById("tokenBalance").innerText = `Your Balance: ${ethers.utils.formatUnits(balance, 18)}`;
+      } catch (error) {
+        addEvent(`Error fetching token info: ${error.message}`);
+      }
+    }
+
+    // Token Interaction: Handle token transfer
+    document.getElementById("transferForm").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      try {
+        const recipient = document.getElementById("transferRecipient").value;
+        const amount = document.getElementById("transferAmount").value;
+        if (!recipient || !amount || Number(amount) <= 0) {
+          alert("Please enter valid recipient and amount.");
+          return;
+        }
+        addEvent("Submitting token transfer transaction...");
+        const tx = await tokenContract.transfer(recipient, ethers.utils.parseUnits(amount.toString(), 18));
+        await tx.wait();
+        addEvent("Token transfer confirmed.");
+        updateTokenInfo();
+      } catch (error) {
+        addEvent(`Error transferring tokens: ${error.message}`);
+      }
+    });
+
+    // Listen to dashboard socket events
+    socket.on("dashboardInit", (data) => {
+      document.getElementById("settlementMode").innerText = `Settlement Mode: ${data.settlementMode}`;
+      document.getElementById("batchSize").innerText = `Batch Size: ${data.batchSize}`;
+      updateTransactionList(data.currentTransactions);
+    });
+
+    socket.on("transactionUpdate", (data) => {
+      updateTransactionList(data.transactions);
+    });
+
+    // Initialize the DApp once the page loads
+    window.addEventListener("load", async () => {
+      await initWeb3();
+      await initializeFHE();
+      fetchStakedBalance();
+      fetchProposals();
+      updateTokenInfo();
+    });
+  </script>
+</body>
+</html>

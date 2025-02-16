@@ -1,0 +1,1615 @@
+version #3
+
+// FHE-Integrated Server with Real-Time Encrypted Transaction Tracking (server.js)
+'use strict';
+const http = require('http');
+const { app, executionLayer } = require('./app');
+const { Server } = require('socket.io');
+const pino = require('pino');
+const fhe = require('fhe-lib'); // Replace with actual FHE library
+const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
+
+const server = http.createServer(app);
+const io = new Server(server, {
+    cors: {
+        origin: '*',
+        methods: ['GET', 'POST']
+    }
+});
+
+// Socket.io connection handling for encrypted transaction updates
+io.on('connection', (socket) => {
+    logger.info(`Dashboard client connected: ${socket.id}`);
+    socket.emit('dashboardInit', {
+        settlementMode: executionLayer.settlementMode,
+        batchSize: executionLayer.batchSize,
+        currentTransactions: executionLayer.transactions.map(tx => ({
+            ...tx,
+            amount: fhe.encrypt(tx.amount) // Ensure all transactions remain encrypted
+        }))
+    });
+
+    socket.on('requestTransactionUpdate', () => {
+        socket.emit('transactionUpdate', {
+            transactions: executionLayer.transactions.map(tx => ({
+                ...tx,
+                amount: fhe.encrypt(tx.amount)
+            }))
+        });
+    });
+
+    socket.on('disconnect', () => {
+        logger.info(`Dashboard client disconnected: ${socket.id}`);
+    });
+});
+
+// Start the FHE-secured server
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    logger.info(`FHE-enabled API server and Dashboard live on port ${PORT}`);
+});
+// FHE-Integrated API Endpoints (transactions.js & settlement.js)
+'use strict';
+const express = require('express');
+const fhe = require('fhe-lib'); // Replace with actual FHE library
+const MerkleTree = require('../modules/merkleTree');
+const router = express.Router();
+
+module.exports = (executionLayer) => {
+    // POST /api/transactions: Submit a fully encrypted transaction
+    router.post('/transactions', async (req, res) => {
+        try {
+            let tx = req.body;
+            tx.amount = fhe.encrypt(tx.amount); // Encrypt transaction amount before processing
+            const settlementMode = req.body.settlementMode;
+            await executionLayer.executeTransaction(tx, settlementMode);
+            res.status(200).json({ status: 'Transaction accepted', encryptedTx: tx });
+        } catch (error) {
+            res.status(400).json({ error: error.message });
+        }
+    });
+
+    // GET /api/merkle-proof: Retrieve a Merkle proof for an encrypted transaction
+    router.get('/merkle-proof', (req, res) => {
+        try {
+            const { txData } = req.query;
+            if (!txData) {
+                return res.status(400).json({ error: 'txData query parameter is required' });
+            }
+            const tx = JSON.parse(txData);
+            const merkleTree = new MerkleTree(executionLayer.transactions);
+            const leaf = merkleTree.hash(fhe.encrypt(JSON.stringify(tx)));
+            const proof = merkleTree.getProof(leaf);
+            res.status(200).json({ tx, proof, merkleRoot: merkleTree.getRoot() });
+        } catch (error) {
+            res.status(500).json({ error: error.message });
+        }
+    });
+
+    return router;
+};
+
+// FHE-Integrated Settlement API (settlement.js)
+module.exports = (executionLayer) => {
+    // POST /api/settle: Trigger settlement for encrypted transactions
+    router.post('/settle', async (req, res) => {
+        try {
+            await executionLayer.settleBatch();
+            res.status(200).json({ status: 'Batch settlement triggered' });
+        } catch (error) {
+            res.status(500).json({ error: error.message });
+        }
+    });
+    return router;
+};
+// FHE-Integrated Smart Contract (ConfidentialSettlement.sol)
+pragma solidity ^0.8.0;
+import "@zama-ai/fhe-solidity/contracts/FHE.sol";
+
+contract ConfidentialSettlement {
+    using FHE for uint256;
+
+    struct EncryptedTransaction {
+        bytes encryptedAmount;
+        address recipient;
+    }
+
+    mapping(bytes32 => EncryptedTransaction) public transactions;
+
+    event TransactionStored(bytes32 indexed txHash, address indexed recipient);
+
+    function storeEncryptedTransaction(bytes32 txHash, bytes memory encryptedAmount, address recipient) public {
+        require(transactions[txHash].recipient == address(0), "Transaction already exists");
+        transactions[txHash] = EncryptedTransaction(encryptedAmount, recipient);
+        emit TransactionStored(txHash, recipient);
+    }
+
+    function verifyEncryptedTransaction(bytes32 txHash, bytes memory proof) public view returns (bool) {
+        return FHE.verifyProof(proof, txHash);
+    }
+
+    function getEncryptedTransaction(bytes32 txHash) public view returns (bytes memory, address) {
+        require(transactions[txHash].recipient != address(0), "Transaction does not exist");
+        return (transactions[txHash].encryptedAmount, transactions[txHash].recipient);
+    }
+}
+// FHE-Integrated Execution Layer (executionLayer.js)
+'use strict';
+const pino = require('pino');
+const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
+const SettlementManager = require('./settlementManager');
+const MerkleTree = require('./merkleTree');
+const fhe = require('fhe-lib'); // Replace with a real FHE library
+
+class ExecutionLayer {
+  constructor(batchSize = 10) {
+    this.transactions = [];
+    this.batchSize = batchSize;
+    this.settlementManager = new SettlementManager();
+    this.settlementMode = process.env.SETTLEMENT_MODE || 'both';
+    this.processedNonces = new Set();
+  }
+
+  async executeTransaction(tx, overrideSettlementMode) {
+    tx.amount = fhe.encrypt(tx.amount);
+    if (!this.fraudCheck(tx)) {
+      logger.error({ tx }, 'Transaction failed fraud check');
+      throw new Error('Fraud check failed');
+    }
+
+    if (tx.nonce !== undefined) {
+      if (this.processedNonces.has(tx.nonce)) {
+        logger.error({ nonce: tx.nonce }, 'Duplicate transaction nonce detected');
+        throw new Error('Duplicate transaction nonce');
+      }
+      this.processedNonces.add(tx.nonce);
+    }
+
+    this.transactions.push(tx);
+    logger.info({ tx }, 'Transaction executed');
+
+    if (overrideSettlementMode) {
+      this.settlementMode = overrideSettlementMode;
+    }
+
+    if (this.transactions.length >= this.batchSize) {
+      await this.settleBatch();
+    }
+  }
+
+  async settleBatch() {
+    if (this.transactions.length === 0) return;
+    const merkleTree = new MerkleTree(this.transactions);
+    const root = merkleTree.getRoot();
+    logger.info({ merkleRoot: root, transactions: this.transactions, settlementMode: this.settlementMode }, 'Batch created');
+
+    try {
+      switch (this.settlementMode.toLowerCase()) {
+        case 'ethereum':
+          await this.settlementManager.settleOnEthereum(root);
+          break;
+        case 'bitcoin':
+          await this.settlementManager.settleOnBitcoin(root);
+          break;
+        case 'both':
+        default:
+          await Promise.all([
+            this.settlementManager.settleOnEthereum(root),
+            this.settlementManager.settleOnBitcoin(root)
+          ]);
+          break;
+      }
+      logger.info({ merkleRoot: root, settlementMode: this.settlementMode }, 'Batch settled');
+    } catch (error) {
+      logger.error({ error: error.message }, 'Error settling batch');
+      throw error;
+    } finally {
+      this.transactions = [];
+    }
+  }
+}
+
+module.exports = ExecutionLayer;
+// FHE-Integrated Merkle Tree (merkleTree.js)
+'use strict';
+const crypto = require('crypto');
+const fhe = require('fhe-lib'); // Replace with a real FHE library
+
+class MerkleTree {
+  constructor(transactions) {
+    this.transactions = transactions;
+    this.leaves = transactions.map(tx => this.hash(fhe.encrypt(JSON.stringify(tx))));
+    this.root = this.buildTree(this.leaves);
+  }
+
+  hash(data) {
+    return crypto.createHash('sha256').update(data).digest('hex');
+  }
+
+  buildTree(leaves) {
+    if (leaves.length === 0) return null;
+    let layer = leaves;
+    while (layer.length > 1) {
+      const nextLayer = [];
+      for (let i = 0; i < layer.length; i += 2) {
+        const left = layer[i];
+        const right = i + 1 < layer.length ? layer[i + 1] : left;
+        nextLayer.push(this.hash(left + right));
+      }
+      layer = nextLayer;
+    }
+    return layer[0];
+  }
+
+  getRoot() {
+    return this.root;
+  }
+}
+
+module.exports = MerkleTree;
+
+-----------------------------------
+
+version #2
+
+/src
+├── api/
+│   ├── transactions.js
+│   └── settlement.js
+├── modules/
+│   ├── settlementManager.js
+│   ├── executionLayer.js
+│   └── merkleTree.js
+├── app.js
+└── server.js
+/src/modules/merkleTree.js
+javascript
+Copy
+Edit
+// merkleTree.js
+'use strict';
+const crypto = require('crypto');
+
+class MerkleTree {
+  constructor(transactions) {
+    this.transactions = transactions;
+    this.leaves = transactions.map(tx => this.hash(JSON.stringify(tx)));
+    this.root = this.buildTree(this.leaves);
+  }
+
+  hash(data) {
+    return crypto.createHash('sha256').update(data).digest('hex');
+  }
+
+  buildTree(leaves) {
+    if (leaves.length === 0) return null;
+    let layer = leaves;
+    while (layer.length > 1) {
+      const nextLayer = [];
+      for (let i = 0; i < layer.length; i += 2) {
+        const left = layer[i];
+        const right = i + 1 < layer.length ? layer[i + 1] : left;
+        nextLayer.push(this.hash(left + right));
+      }
+      layer = nextLayer;
+    }
+    return layer[0];
+  }
+
+  getRoot() {
+    return this.root;
+  }
+
+  getProof(leaf) {
+    let index = this.leaves.indexOf(leaf);
+    if (index === -1) return null;
+    const proof = [];
+    let layer = this.leaves.slice();
+    while (layer.length > 1) {
+      const nextLayer = [];
+      for (let i = 0; i < layer.length; i += 2) {
+        const left = layer[i];
+        const right = i + 1 < layer.length ? layer[i + 1] : left;
+        if (i === index || i + 1 === index) {
+          proof.push(i === index ? right : left);
+        }
+        nextLayer.push(this.hash(left + right));
+      }
+      index = Math.floor(index / 2);
+      layer = nextLayer;
+    }
+    return proof;
+  }
+
+  verifyProof(leaf, proof, root) {
+    let computedHash = leaf;
+    for (const sibling of proof) {
+      computedHash = this.hash(computedHash + sibling);
+    }
+    return computedHash === root;
+  }
+}
+
+module.exports = MerkleTree;
+/src/modules/settlementManager.js
+javascript
+Copy
+Edit
+// settlementManager.js
+'use strict';
+require('dotenv').config();
+const { ethers } = require('ethers');
+const bitcoin = require('bitcoinjs-lib');
+const axios = require('axios');
+const pino = require('pino');
+const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
+
+// Dummy function for secure key retrieval.
+// In production, integrate with an HSM, Vault, or MPC solution.
+function getPrivateKeyFromVault(keyName) {
+  return process.env[keyName];
+}
+
+class SettlementManager {
+  constructor() {
+    // Ethereum configuration
+    const ethereumRpc = process.env.ETHEREUM_RPC;
+    this.ethProvider = new ethers.JsonRpcProvider(ethereumRpc);
+    const privateKey = getPrivateKeyFromVault('PRIVATE_KEY');
+    this.ethWallet = new ethers.Wallet(privateKey, this.ethProvider);
+    this.ethContractAddress = process.env.CONTRACT_ADDRESS;
+    this.ethContractABI = ['function storeMerkleRoot(bytes32 root) public'];
+    this.ethContract = new ethers.Contract(this.ethContractAddress, this.ethContractABI, this.ethWallet);
+
+    // Bitcoin configuration
+    this.bitcoinNetwork = process.env.BITCOIN_NETWORK === 'mainnet'
+      ? bitcoin.networks.bitcoin
+      : bitcoin.networks.testnet;
+    const bitcoinWif = getPrivateKeyFromVault('BITCOIN_WIF_PRIVATE_KEY');
+    this.bitcoinKeyPair = bitcoin.ECPair.fromWIF(bitcoinWif, this.bitcoinNetwork);
+    this.bitcoinAddress = bitcoin.payments.p2pkh({
+      pubkey: this.bitcoinKeyPair.publicKey,
+      network: this.bitcoinNetwork
+    }).address;
+    this.bitcoinPrevTxId = process.env.BITCOIN_PREVIOUS_TX_ID;
+    this.bitcoinPrevTxVout = parseInt(process.env.BITCOIN_PREVIOUS_TX_VOUT || '0');
+    this.bitcoinOutputAmount = parseInt(process.env.BITCOIN_OUTPUT_AMOUNT || '1000');
+    // URL for broadcasting Bitcoin transactions (e.g. via mempool.space)
+    this.bitcoinBroadcastUrl = process.env.BITCOIN_BROADCAST_URL || 'https://mempool.space/api/tx';
+  }
+
+  async settleOnEthereum(rootHash) {
+    try {
+      logger.info(`Settling on Ethereum with root: ${rootHash}`);
+      const tx = await this.ethContract.storeMerkleRoot(
+        ethers.keccak256(ethers.toUtf8Bytes(rootHash))
+      );
+      logger.info({ txHash: tx.hash }, 'Ethereum settlement transaction submitted');
+      await tx.wait();
+      logger.info('Ethereum settlement confirmed');
+      return { status: 'confirmed', txHash: tx.hash };
+    } catch (error) {
+      logger.error({ error: error.message }, 'Error settling on Ethereum');
+      throw new Error(`Ethereum settlement failed: ${error.message}`);
+    }
+  }
+
+  async settleOnBitcoin(rootHash) {
+    try {
+      logger.info(`Settling on Bitcoin with root: ${rootHash}`);
+      const txb = new bitcoin.TransactionBuilder(this.bitcoinNetwork);
+      txb.addInput(this.bitcoinPrevTxId, this.bitcoinPrevTxVout);
+      // First output: minimal amount sent to our own address.
+      txb.addOutput(this.bitcoinAddress, this.bitcoinOutputAmount);
+      // Second output: embed the Merkle root via OP_RETURN.
+      const data = Buffer.from(rootHash, 'hex');
+      const embed = bitcoin.payments.embed({ data: [data] });
+      txb.addOutput(embed.output, 0);
+      txb.sign(0, this.bitcoinKeyPair);
+      const tx = txb.build();
+      const txHex = tx.toHex();
+      logger.info({ txHex }, 'Bitcoin transaction built');
+      // Broadcast the transaction using an external API.
+      const response = await axios.post(this.bitcoinBroadcastUrl, txHex, {
+        headers: { 'Content-Type': 'text/plain' }
+      });
+      logger.info({ broadcastResponse: response.data }, 'Bitcoin transaction broadcasted');
+      return { status: 'broadcasted', txHex, broadcastResponse: response.data };
+    } catch (error) {
+      logger.error({ error: error.message }, 'Error settling on Bitcoin');
+      throw new Error(`Bitcoin settlement failed: ${error.message}`);
+    }
+  }
+}
+
+module.exports = SettlementManager;
+/src/modules/executionLayer.js
+javascript
+Copy
+Edit
+// executionLayer.js
+'use strict';
+const pino = require('pino');
+const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
+const SettlementManager = require('./settlementManager');
+const MerkleTree = require('./merkleTree');
+
+class ExecutionLayer {
+  constructor(batchSize = 10) {
+    this.transactions = [];
+    this.batchSize = batchSize;
+    this.settlementManager = new SettlementManager();
+    // Settlement mode: 'ethereum', 'bitcoin', or 'both'
+    this.settlementMode = process.env.SETTLEMENT_MODE || 'both';
+    // Track processed nonces to prevent replay attacks.
+    this.processedNonces = new Set();
+  }
+
+  async executeTransaction(tx, overrideSettlementMode) {
+    if (!this.fraudCheck(tx)) {
+      logger.error({ tx }, 'Transaction failed fraud check');
+      throw new Error('Fraud check failed');
+    }
+    // Check for nonce replay if provided.
+    if (tx.nonce !== undefined) {
+      if (this.processedNonces.has(tx.nonce)) {
+        logger.error({ nonce: tx.nonce }, 'Duplicate transaction nonce detected');
+        throw new Error('Duplicate transaction nonce');
+      }
+      this.processedNonces.add(tx.nonce);
+    }
+    this.transactions.push(tx);
+    logger.info({ tx }, 'Transaction executed');
+    if (overrideSettlementMode) {
+      this.settlementMode = overrideSettlementMode;
+    }
+    if (this.transactions.length >= this.batchSize) {
+      await this.settleBatch();
+    }
+  }
+
+  fraudCheck(tx) {
+    // Basic validation: ensure 'from', 'to', numeric 'amount' are present.
+    if (!tx.from || !tx.to || typeof tx.amount !== 'number') return false;
+    if (tx.code && (typeof tx.code !== 'string' || tx.code.trim() === '')) return false;
+    // Optional: if nonce is provided, it must be a number.
+    if (tx.nonce !== undefined && typeof tx.nonce !== 'number') return false;
+    return true;
+  }
+
+  async settleBatch() {
+    if (this.transactions.length === 0) return;
+    const merkleTree = new MerkleTree(this.transactions);
+    const root = merkleTree.getRoot();
+    logger.info({ merkleRoot: root, transactions: this.transactions, settlementMode: this.settlementMode }, 'Batch created');
+
+    // Verify each transaction's inclusion via its Merkle proof.
+    for (const tx of this.transactions) {
+      const leaf = merkleTree.hash(JSON.stringify(tx));
+      const proof = merkleTree.getProof(leaf);
+      const isValid = merkleTree.verifyProof(leaf, proof, root);
+      if (!isValid) {
+        logger.error({ tx }, 'Fraudulent transaction detected');
+        throw new Error('Fraudulent transaction detected');
+      }
+    }
+
+    // Settle based on the configured settlement mode.
+    try {
+      switch (this.settlementMode.toLowerCase()) {
+        case 'ethereum':
+          await this.settlementManager.settleOnEthereum(root);
+          break;
+        case 'bitcoin':
+          await this.settlementManager.settleOnBitcoin(root);
+          break;
+        case 'both':
+        default:
+          await Promise.all([
+            this.settlementManager.settleOnEthereum(root),
+            this.settlementManager.settleOnBitcoin(root)
+          ]);
+          break;
+      }
+      logger.info({ merkleRoot: root, settlementMode: this.settlementMode }, 'Batch settled');
+    } catch (error) {
+      logger.error({ error: error.message }, 'Error settling batch');
+      throw error;
+    } finally {
+      this.transactions = [];
+    }
+  }
+}
+
+module.exports = ExecutionLayer;
+/src/api/transactions.js
+javascript
+Copy
+Edit
+// transactions.js
+'use strict';
+const express = require('express');
+const MerkleTree = require('../modules/merkleTree');
+const router = express.Router();
+
+module.exports = (executionLayer) => {
+  // POST /api/transactions: submit a transaction.
+  router.post('/transactions', async (req, res) => {
+    try {
+      const tx = req.body;
+      const settlementMode = req.body.settlementMode; // Optional override.
+      await executionLayer.executeTransaction(tx, settlementMode);
+      res.status(200).json({ status: 'Transaction accepted', tx });
+    } catch (error) {
+      res.status(400).json({ error: error.message });
+    }
+  });
+
+  // GET /api/merkle-proof: retrieve a Merkle proof for a transaction.
+  router.get('/merkle-proof', (req, res) => {
+    try {
+      const { txData } = req.query;
+      if (!txData) {
+        res.status(400).json({ error: 'txData query parameter is required' });
+        return;
+      }
+      const tx = JSON.parse(txData);
+      const merkleTree = new MerkleTree(executionLayer.transactions);
+      const leaf = merkleTree.hash(JSON.stringify(tx));
+      const proof = merkleTree.getProof(leaf);
+      res.status(200).json({ tx, proof, merkleRoot: merkleTree.getRoot() });
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  return router;
+};
+/src/api/settlement.js
+javascript
+Copy
+Edit
+// settlement.js
+'use strict';
+const express = require('express');
+const router = express.Router();
+
+module.exports = (executionLayer) => {
+  // POST /api/settle: manually trigger settlement for the current batch.
+  router.post('/settle', async (req, res) => {
+    try {
+      await executionLayer.settleBatch();
+      res.status(200).json({ status: 'Batch settlement triggered' });
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  return router;
+};
+/src/app.js
+javascript
+Copy
+Edit
+// app.js
+'use strict';
+require('dotenv').config();
+const express = require('express');
+const bodyParser = require('body-parser');
+const path = require('path');
+const ExecutionLayer = require('./modules/executionLayer');
+
+const app = express();
+const executionLayer = new ExecutionLayer(parseInt(process.env.BATCH_SIZE) || 10);
+
+// Middleware
+app.use(bodyParser.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Mount API routes.
+const transactionsRouter = require('./api/transactions')(executionLayer);
+const settlementRouter = require('./api/settlement')(executionLayer);
+app.use('/api', transactionsRouter);
+app.use('/api', settlementRouter);
+
+// Serve the dashboard page.
+app.get('/dashboard', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+module.exports = { app, executionLayer };
+/src/server.js
+javascript
+Copy
+Edit
+// server.js
+'use strict';
+const http = require('http');
+const { app, executionLayer } = require('./app');
+const { Server } = require('socket.io');
+const pino = require('pino');
+const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
+
+const server = http.createServer(app);
+const io = new Server(server);
+
+// Socket.io connection handling for dashboard updates.
+io.on('connection', (socket) => {
+  logger.info(`Dashboard client connected: ${socket.id}`);
+  socket.emit('dashboardInit', {
+    settlementMode: executionLayer.settlementMode,
+    batchSize: executionLayer.batchSize,
+    currentTransactions: executionLayer.transactions,
+  });
+
+  socket.on('disconnect', () => {
+    logger.info(`Dashboard client disconnected: ${socket.id}`);
+  });
+});
+
+// Start the server.
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  logger.info(`API server and Dashboard listening on port ${PORT}`);
+});
+
+---------------------------------
+
+version #1
+
+
+'use strict';
+require('dotenv').config();
+
+const express = require('express');
+const bodyParser = require('body-parser');
+const http = require('http');
+const crypto = require('crypto');
+const { ethers } = require('ethers');
+const bitcoin = require('bitcoinjs-lib');
+const { Server } = require('socket.io');
+const path = require('path');
+
+// Create Express app and HTTP server.
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+
+// Use middleware.
+app.use(bodyParser.json());
+app.use(express.static(path.join(__dirname, 'public'))); // Serve static files from "public" folder
+
+/**
+ * SettlementManager handles settlement on Ethereum and Bitcoin.
+ */
+class SettlementManager {
+  constructor() {
+    // Ethereum configuration using environment variables.
+    this.ethProvider = new ethers.JsonRpcProvider(process.env.ETHEREUM_RPC);
+    this.ethWallet = new ethers.Wallet(process.env.PRIVATE_KEY, this.ethProvider);
+    this.ethContractAddress = process.env.CONTRACT_ADDRESS;
+    // Minimal contract ABI for storing a Merkle root.
+    this.ethContractABI = ['function storeMerkleRoot(bytes32 root) public'];
+    this.ethContract = new ethers.Contract(this.ethContractAddress, this.ethContractABI, this.ethWallet);
+
+    // Bitcoin configuration using environment variables.
+    this.bitcoinNetwork = process.env.BITCOIN_NETWORK === 'mainnet'
+      ? bitcoin.networks.bitcoin
+      : bitcoin.networks.testnet;
+    this.bitcoinKeyPair = bitcoin.ECPair.fromWIF(process.env.BITCOIN_WIF_PRIVATE_KEY, this.bitcoinNetwork);
+    this.bitcoinAddress = bitcoin.payments.p2pkh({
+      pubkey: this.bitcoinKeyPair.publicKey,
+      network: this.bitcoinNetwork
+    }).address;
+    this.bitcoinPrevTxId = process.env.BITCOIN_PREVIOUS_TX_ID;
+    this.bitcoinPrevTxVout = parseInt(process.env.BITCOIN_PREVIOUS_TX_VOUT || '0');
+    this.bitcoinOutputAmount = parseInt(process.env.BITCOIN_OUTPUT_AMOUNT || '1000');
+  }
+
+  async settleOnEthereum(rootHash) {
+    try {
+      console.log(`Settling on Ethereum with root: ${rootHash}`);
+      const tx = await this.ethContract.storeMerkleRoot(
+        ethers.keccak256(ethers.toUtf8Bytes(rootHash))
+      );
+      console.log('Ethereum Settlement TX:', tx.hash);
+      await tx.wait();
+      console.log('Ethereum Settlement Confirmed');
+      io.emit('settlementUpdate', { chain: 'ethereum', status: 'confirmed', txHash: tx.hash });
+    } catch (error) {
+      console.error('Error settling on Ethereum:', error);
+      io.emit('settlementUpdate', { chain: 'ethereum', status: 'error', error: error.message });
+    }
+  }
+
+  async settleOnBitcoin(rootHash) {
+    try {
+      console.log(`Settling on Bitcoin with root: ${rootHash}`);
+      const txb = new bitcoin.TransactionBuilder(this.bitcoinNetwork);
+      txb.addInput(this.bitcoinPrevTxId, this.bitcoinPrevTxVout);
+      // First output: minimal amount sent back to our own address.
+      txb.addOutput(this.bitcoinAddress, this.bitcoinOutputAmount);
+      // Second output: embed the Merkle root via OP_RETURN.
+      const data = Buffer.from(rootHash, 'hex');
+      const embed = bitcoin.payments.embed({ data: [data] });
+      txb.addOutput(embed.output, 0);
+      txb.sign(0, this.bitcoinKeyPair);
+      const tx = txb.build();
+      console.log('Bitcoin Settlement TX (hex):', tx.toHex());
+      io.emit('settlementUpdate', { chain: 'bitcoin', status: 'built', txHex: tx.toHex() });
+      // In production, broadcast the transaction via a Bitcoin node/API.
+    } catch (error) {
+      console.error('Error settling on Bitcoin:', error);
+      io.emit('settlementUpdate', { chain: 'bitcoin', status: 'error', error: error.message });
+    }
+  }
+}
+
+/**
+ * MerkleTree constructs a Merkle tree from transaction data,
+ * and provides proof generation and verification methods.
+ */
+class MerkleTree {
+  constructor(transactions) {
+    this.transactions = transactions;
+    this.leaves = transactions.map(tx => this.hash(JSON.stringify(tx)));
+    this.root = this.buildTree(this.leaves);
+  }
+
+  hash(data) {
+    return crypto.createHash('sha256').update(data).digest('hex');
+  }
+
+  buildTree(leaves) {
+    if (leaves.length === 0) return null;
+    let layer = leaves;
+    while (layer.length > 1) {
+      let nextLayer = [];
+      for (let i = 0; i < layer.length; i += 2) {
+        const left = layer[i];
+        const right = i + 1 < layer.length ? layer[i + 1] : left;
+        nextLayer.push(this.hash(left + right));
+      }
+      layer = nextLayer;
+    }
+    return layer[0];
+  }
+
+  getRoot() {
+    return this.root;
+  }
+
+  getProof(leaf) {
+    let index = this.leaves.indexOf(leaf);
+    if (index === -1) return null;
+    let proof = [];
+    let layer = this.leaves.slice();
+    while (layer.length > 1) {
+      let nextLayer = [];
+      for (let i = 0; i < layer.length; i += 2) {
+        const left = layer[i];
+        const right = i + 1 < layer.length ? layer[i + 1] : left;
+        if (i === index || i + 1 === index) {
+          proof.push(i === index ? right : left);
+        }
+        nextLayer.push(this.hash(left + right));
+      }
+      index = Math.floor(index / 2);
+      layer = nextLayer;
+    }
+    return proof;
+  }
+
+  verifyProof(leaf, proof, root) {
+    let computedHash = leaf;
+    for (let sibling of proof) {
+      computedHash = this.hash(computedHash + sibling);
+    }
+    return computedHash === root;
+  }
+}
+
+/**
+ * ExecutionLayer simulates off-chain transaction execution,
+ * supports batching, fraud prevention, and optional code transparency.
+ */
+class ExecutionLayer {
+  constructor(batchSize = 10) {
+    this.transactions = [];
+    this.batchSize = batchSize;
+    this.settlementManager = new SettlementManager();
+    this.settlementMode = process.env.SETTLEMENT_MODE || 'both';
+  }
+
+  async executeTransaction(tx, overrideSettlementMode) {
+    if (!this.fraudCheck(tx)) {
+      console.error('Transaction failed fraud check:', tx);
+      io.emit('transactionError', { tx, error: 'Fraud check failed' });
+      throw new Error('Fraud check failed');
+    }
+    this.transactions.push(tx);
+    console.log(`Executed: ${JSON.stringify(tx)}`);
+    io.emit('transactionExecuted', tx);
+    if (overrideSettlementMode) {
+      this.settlementMode = overrideSettlementMode;
+    }
+    if (this.transactions.length >= this.batchSize) {
+      await this.settleBatch();
+    }
+  }
+
+  fraudCheck(tx) {
+    if (!tx.from || !tx.to || typeof tx.amount !== 'number') return false;
+    if (tx.code && (typeof tx.code !== 'string' || tx.code.trim() === '')) return false;
+    return true;
+  }
+
+  async settleBatch() {
+    if (this.transactions.length === 0) return;
+    const merkleTree = new MerkleTree(this.transactions);
+    const root = merkleTree.getRoot();
+    console.log('Batch Merkle Root:', root);
+    io.emit('batchCreated', { merkleRoot: root, transactions: this.transactions, settlementMode: this.settlementMode });
+
+    // Verify each transaction's inclusion via its Merkle proof.
+    for (const tx of this.transactions) {
+      const leaf = merkleTree.hash(JSON.stringify(tx));
+      const proof = merkleTree.getProof(leaf);
+      const isValid = merkleTree.verifyProof(leaf, proof, root);
+      if (!isValid) {
+        console.error('Fraudulent transaction detected:', tx);
+        io.emit('fraudAlert', tx);
+        throw new Error('Fraudulent transaction detected');
+      }
+    }
+
+    // Settle based on the configured settlement mode.
+    switch (this.settlementMode.toLowerCase()) {
+      case 'ethereum':
+        await this.settlementManager.settleOnEthereum(root);
+        break;
+      case 'bitcoin':
+        await this.settlementManager.settleOnBitcoin(root);
+        break;
+      case 'both':
+      default:
+        await Promise.all([
+          this.settlementManager.settleOnEthereum(root),
+          this.settlementManager.settleOnBitcoin(root)
+        ]);
+        break;
+    }
+    io.emit('batchSettled', { merkleRoot: root, settlementMode: this.settlementMode });
+    this.transactions = [];
+  }
+}
+
+ETHEREUM_RPC=https://your.ethereum.rpc.endpoint
+PRIVATE_KEY=your_ethereum_private_key
+CONTRACT_ADDRESS=your_smart_contract_address
+BITCOIN_WIF_PRIVATE_KEY=your_bitcoin_wif_key
+BITCOIN_NETWORK=testnet  // or 'mainnet'
+BITCOIN_PREVIOUS_TX_ID=your_previous_tx_id
+BITCOIN_PREVIOUS_TX_VOUT=0
+BITCOIN_OUTPUT_AMOUNT=1000
+
+
+// Global ExecutionLayer instance.
+const executionLayer = new ExecutionLayer(parseInt(process.env.BATCH_SIZE) || 10);
+
+/**
+ * Express API Endpoints
+ */
+app.post('/api/transactions', async (req, res) => {
+  try {
+    const tx = req.body;
+    const settlementMode = req.body.settlementMode; // Optional override.
+    await executionLayer.executeTransaction(tx, settlementMode);
+    res.status(200).json({ status: 'Transaction accepted', tx });
+  } catch (error) {
+    console.error('Error processing transaction:', error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post('/api/settle', async (req, res) => {
+  try {
+    await executionLayer.settleBatch();
+    res.status(200).json({ status: 'Batch settlement triggered' });
+  } catch (error) {
+    console.error('Error during settlement:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/merkle-proof', (req, res) => {
+  try {
+    const { txData } = req.query;
+    if (!txData) {
+      res.status(400).json({ error: 'txData query parameter is required' });
+      return;
+    }
+    const tx = JSON.parse(txData);
+    const merkleTree = new MerkleTree(executionLayer.transactions);
+    const leaf = merkleTree.hash(JSON.stringify(tx));
+    const proof = merkleTree.getProof(leaf);
+    res.status(200).json({ tx, proof, merkleRoot: merkleTree.getRoot() });
+  } catch (error) {
+    console.error('Error generating Merkle proof:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Serve the dashboard page.
+app.get('/dashboard', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// Start the server.
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`API server and Dashboard listening on port ${PORT}`);
+});
+
+// Socket.io connection handling.
+io.on('connection', (socket) => {
+  console.log('Dashboard client connected:', socket.id);
+  socket.emit('dashboardInit', {
+    settlementMode: executionLayer.settlementMode,
+    batchSize: executionLayer.batchSize,
+    currentTransactions: executionLayer.transactions,
+  });
+
+  socket.on('disconnect', () => {
+    console.log('Dashboard client disconnected:', socket.id);
+  });
+});
+'use strict';
+require('dotenv').config();
+
+const express = require('express');
+const bodyParser = require('body-parser');
+const crypto = require('crypto');
+const { ethers } = require('ethers');
+const bitcoin = require('bitcoinjs-lib');
+
+/**
+ * SettlementManager handles settlement on Ethereum and Bitcoin.
+ */
+class SettlementManager {
+  constructor() {
+    // Ethereum configuration using environment variables.
+    this.ethProvider = new ethers.JsonRpcProvider(process.env.ETHEREUM_RPC);
+    this.ethWallet = new ethers.Wallet(process.env.PRIVATE_KEY, this.ethProvider);
+    this.ethContractAddress = process.env.CONTRACT_ADDRESS;
+    // Minimal contract ABI for storing a Merkle root.
+    this.ethContractABI = ['function storeMerkleRoot(bytes32 root) public'];
+    this.ethContract = new ethers.Contract(this.ethContractAddress, this.ethContractABI, this.ethWallet);
+
+    // Bitcoin configuration using environment variables.
+    this.bitcoinNetwork = process.env.BITCOIN_NETWORK === 'mainnet'
+      ? bitcoin.networks.bitcoin
+      : bitcoin.networks.testnet;
+    this.bitcoinKeyPair = bitcoin.ECPair.fromWIF(process.env.BITCOIN_WIF_PRIVATE_KEY, this.bitcoinNetwork);
+    this.bitcoinAddress = bitcoin.payments.p2pkh({
+      pubkey: this.bitcoinKeyPair.publicKey,
+      network: this.bitcoinNetwork
+    }).address;
+    this.bitcoinPrevTxId = process.env.BITCOIN_PREVIOUS_TX_ID;
+    this.bitcoinPrevTxVout = parseInt(process.env.BITCOIN_PREVIOUS_TX_VOUT || '0');
+    this.bitcoinOutputAmount = parseInt(process.env.BITCOIN_OUTPUT_AMOUNT || '1000');
+  }
+
+  /**
+   * Settles the given Merkle root on Ethereum.
+   * @param {string} rootHash - The Merkle root hash.
+   */
+  async settleOnEthereum(rootHash) {
+    try {
+      console.log(`Settling on Ethereum with root: ${rootHash}`);
+      const tx = await this.ethContract.storeMerkleRoot(
+        ethers.keccak256(ethers.toUtf8Bytes(rootHash))
+      );
+      console.log('Ethereum Settlement TX:', tx.hash);
+      await tx.wait();
+      console.log('Ethereum Settlement Confirmed');
+    } catch (error) {
+      console.error('Error settling on Ethereum:', error);
+    }
+  }
+
+  /**
+   * Settles the given Merkle root on Bitcoin by creating an OP_RETURN transaction.
+   * For production, integrate with a Bitcoin node or API for broadcasting.
+   * @param {string} rootHash - The Merkle root hash.
+   */
+  async settleOnBitcoin(rootHash) {
+    try {
+      console.log(`Settling on Bitcoin with root: ${rootHash}`);
+      const txb = new bitcoin.TransactionBuilder(this.bitcoinNetwork);
+      txb.addInput(this.bitcoinPrevTxId, this.bitcoinPrevTxVout);
+      // First output: minimal amount sent back to our own address.
+      txb.addOutput(this.bitcoinAddress, this.bitcoinOutputAmount);
+      // Second output: embed the Merkle root via OP_RETURN.
+      const data = Buffer.from(rootHash, 'hex');
+      const embed = bitcoin.payments.embed({ data: [data] });
+      txb.addOutput(embed.output, 0);
+      txb.sign(0, this.bitcoinKeyPair);
+      const tx = txb.build();
+      console.log('Bitcoin Settlement TX (hex):', tx.toHex());
+      // In production, broadcast the transaction via a Bitcoin node/API.
+    } catch (error) {
+      console.error('Error settling on Bitcoin:', error);
+    }
+  }
+}
+
+/**
+ * MerkleTree constructs a Merkle tree from transaction data,
+ * and provides proof generation and verification.
+ */
+class MerkleTree {
+  constructor(transactions) {
+    this.transactions = transactions;
+    this.leaves = transactions.map(tx => this.hash(JSON.stringify(tx)));
+    this.root = this.buildTree(this.leaves);
+  }
+
+  hash(data) {
+    return crypto.createHash('sha256').update(data).digest('hex');
+  }
+
+  buildTree(leaves) {
+    if (leaves.length === 0) return null;
+    let layer = leaves;
+    while (layer.length > 1) {
+      let nextLayer = [];
+      for (let i = 0; i < layer.length; i += 2) {
+        const left = layer[i];
+        const right = i + 1 < layer.length ? layer[i + 1] : left;
+        nextLayer.push(this.hash(left + right));
+      }
+      layer = nextLayer;
+    }
+    return layer[0];
+  }
+
+  getRoot() {
+    return this.root;
+  }
+
+  getProof(leaf) {
+    let index = this.leaves.indexOf(leaf);
+    if (index === -1) return null;
+    let proof = [];
+    let layer = this.leaves.slice();
+    while (layer.length > 1) {
+      let nextLayer = [];
+      for (let i = 0; i < layer.length; i += 2) {
+        const left = layer[i];
+        const right = i + 1 < layer.length ? layer[i + 1] : left;
+        if (i === index || i + 1 === index) {
+          proof.push(i === index ? right : left);
+        }
+        nextLayer.push(this.hash(left + right));
+      }
+      index = Math.floor(index / 2);
+      layer = nextLayer;
+    }
+    return proof;
+  }
+
+  verifyProof(leaf, proof, root) {
+    let computedHash = leaf;
+    for (let sibling of proof) {
+      computedHash = this.hash(computedHash + sibling);
+    }
+    return computedHash === root;
+  }
+}
+
+/**
+ * ExecutionLayer simulates off-chain transaction execution,
+ * supports batching, fraud prevention, and optional code transparency.
+ */
+class ExecutionLayer {
+  constructor(batchSize = 10) {
+    this.transactions = [];
+    this.batchSize = batchSize;
+    this.settlementManager = new SettlementManager();
+    // Default settlement mode: 'ethereum', 'bitcoin', or 'both'.
+    this.settlementMode = process.env.SETTLEMENT_MODE || 'both';
+  }
+
+  /**
+   * Execute a transaction, allowing for dynamic override of settlement mode.
+   * @param {Object} tx - Must include 'from', 'to', numeric 'amount'; optionally 'code'
+   * @param {string} [overrideSettlementMode] - Optional settlement mode override.
+   */
+  async executeTransaction(tx, overrideSettlementMode) {
+    if (!this.fraudCheck(tx)) {
+      console.error('Transaction failed fraud check:', tx);
+      throw new Error('Fraud check failed');
+    }
+    this.transactions.push(tx);
+    console.log(`Executed: ${JSON.stringify(tx)}`);
+    if (overrideSettlementMode) {
+      this.settlementMode = overrideSettlementMode;
+    }
+    if (this.transactions.length >= this.batchSize) {
+      await this.settleBatch();
+    }
+  }
+
+  fraudCheck(tx) {
+    if (!tx.from || !tx.to || typeof tx.amount !== 'number') return false;
+    if (tx.code && (typeof tx.code !== 'string' || tx.code.trim() === '')) return false;
+    return true;
+  }
+
+  /**
+   * Settles the current batch by:
+   * 1. Generating a Merkle tree from the batch.
+   * 2. Verifying each transaction's inclusion via its Merkle proof.
+   * 3. Settling the batch on the configured chain(s).
+   */
+  async settleBatch() {
+    if (this.transactions.length === 0) return;
+    const merkleTree = new MerkleTree(this.transactions);
+    const root = merkleTree.getRoot();
+    console.log('Batch Merkle Root:', root);
+
+    // Fraud prevention: verify each transaction's proof.
+    for (const tx of this.transactions) {
+      const leaf = merkleTree.hash(JSON.stringify(tx));
+      const proof = merkleTree.getProof(leaf);
+      const isValid = merkleTree.verifyProof(leaf, proof, root);
+      if (!isValid) {
+        console.error('Fraudulent transaction detected:', tx);
+        throw new Error('Fraudulent transaction detected');
+      }
+    }
+
+    switch (this.settlementMode.toLowerCase()) {
+      case 'ethereum':
+        await this.settlementManager.settleOnEthereum(root);
+        break;
+      case 'bitcoin':
+        await this.settlementManager.settleOnBitcoin(root);
+        break;
+      case 'both':
+      default:
+        await Promise.all([
+          this.settlementManager.settleOnEthereum(root),
+          this.settlementManager.settleOnBitcoin(root)
+        ]);
+        break;
+    }
+    this.transactions = [];
+  }
+}
+
+/**
+ * Express API Server
+ * Exposes endpoints for applications to tie into the platform dynamically.
+ */
+const app = express();
+const port = process.env.PORT || 3000;
+app.use(bodyParser.json());
+
+// Create a global ExecutionLayer instance.
+// In production, consider persistence, clustering, or state management.
+const executionLayer = new ExecutionLayer(parseInt(process.env.BATCH_SIZE) || 10);
+
+/**
+ * Endpoint: POST /api/transactions
+ * Submit a transaction. Optional parameter 'settlementMode' in the request body
+ * can override the default settlement mode.
+ */
+app.post('/api/transactions', async (req, res) => {
+  try {
+    const tx = req.body;
+    const settlementMode = req.body.settlementMode; // Optional override
+    await executionLayer.executeTransaction(tx, settlementMode);
+    res.status(200).json({ status: 'Transaction accepted', tx });
+  } catch (error) {
+    console.error('Error processing transaction:', error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+/**
+ * Endpoint: POST /api/settle
+ * Manually trigger settlement for the current batch.
+ */
+app.post('/api/settle', async (req, res) => {
+  try {
+    await executionLayer.settleBatch();
+    res.status(200).json({ status: 'Batch settlement triggered' });
+  } catch (error) {
+    console.error('Error during settlement:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Endpoint: GET /api/merkle-proof
+ * Retrieve a Merkle proof for a given transaction from the current batch.
+ * Expects a query parameter 'txData' (a JSON string of the transaction).
+ */
+app.get('/api/merkle-proof', (req, res) => {
+  try {
+    const { txData } = req.query;
+    if (!txData) {
+      res.status(400).json({ error: 'txData query parameter is required' });
+      return;
+    }
+    const tx = JSON.parse(txData);
+    const merkleTree = new MerkleTree(executionLayer.transactions);
+    const leaf = merkleTree.hash(JSON.stringify(tx));
+    const proof = merkleTree.getProof(leaf);
+    res.status(200).json({ tx, proof, merkleRoot: merkleTree.getRoot() });
+  } catch (error) {
+    console.error('Error generating Merkle proof:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Start the API server.
+app.listen(port, () => {
+  console.log(`API server listening on port ${port}`);
+});
+'use strict';
+require('dotenv').config();
+
+const express = require('express');
+const bodyParser = require('body-parser');
+const http = require('http');
+const crypto = require('crypto');
+const { ethers } = require('ethers');
+const bitcoin = require('bitcoinjs-lib');
+const { Server } = require('socket.io');
+const path = require('path');
+
+// Create Express app and HTTP server.
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+
+// Use middleware.
+app.use(bodyParser.json());
+app.use(express.static(path.join(__dirname, 'public'))); // Serve static files from "public" folder
+
+/**
+ * SettlementManager handles settlement on Ethereum and Bitcoin.
+ */
+class SettlementManager {
+  constructor() {
+    // Ethereum configuration using environment variables.
+    this.ethProvider = new ethers.JsonRpcProvider(process.env.ETHEREUM_RPC);
+    this.ethWallet = new ethers.Wallet(process.env.PRIVATE_KEY, this.ethProvider);
+    this.ethContractAddress = process.env.CONTRACT_ADDRESS;
+    // Minimal contract ABI for storing a Merkle root.
+    this.ethContractABI = ['function storeMerkleRoot(bytes32 root) public'];
+    this.ethContract = new ethers.Contract(this.ethContractAddress, this.ethContractABI, this.ethWallet);
+
+    // Bitcoin configuration using environment variables.
+    this.bitcoinNetwork = process.env.BITCOIN_NETWORK === 'mainnet'
+      ? bitcoin.networks.bitcoin
+      : bitcoin.networks.testnet;
+    this.bitcoinKeyPair = bitcoin.ECPair.fromWIF(process.env.BITCOIN_WIF_PRIVATE_KEY, this.bitcoinNetwork);
+    this.bitcoinAddress = bitcoin.payments.p2pkh({
+      pubkey: this.bitcoinKeyPair.publicKey,
+      network: this.bitcoinNetwork
+    }).address;
+    this.bitcoinPrevTxId = process.env.BITCOIN_PREVIOUS_TX_ID;
+    this.bitcoinPrevTxVout = parseInt(process.env.BITCOIN_PREVIOUS_TX_VOUT || '0');
+    this.bitcoinOutputAmount = parseInt(process.env.BITCOIN_OUTPUT_AMOUNT || '1000');
+  }
+
+  async settleOnEthereum(rootHash) {
+    try {
+      console.log(`Settling on Ethereum with root: ${rootHash}`);
+      const tx = await this.ethContract.storeMerkleRoot(
+        ethers.keccak256(ethers.toUtf8Bytes(rootHash))
+      );
+      console.log('Ethereum Settlement TX:', tx.hash);
+      await tx.wait();
+      console.log('Ethereum Settlement Confirmed');
+      io.emit('settlementUpdate', { chain: 'ethereum', status: 'confirmed', txHash: tx.hash });
+    } catch (error) {
+      console.error('Error settling on Ethereum:', error);
+      io.emit('settlementUpdate', { chain: 'ethereum', status: 'error', error: error.message });
+    }
+  }
+
+  async settleOnBitcoin(rootHash) {
+    try {
+      console.log(`Settling on Bitcoin with root: ${rootHash}`);
+      const txb = new bitcoin.TransactionBuilder(this.bitcoinNetwork);
+      txb.addInput(this.bitcoinPrevTxId, this.bitcoinPrevTxVout);
+      // First output: minimal amount sent back to our own address.
+      txb.addOutput(this.bitcoinAddress, this.bitcoinOutputAmount);
+      // Second output: embed the Merkle root via OP_RETURN.
+      const data = Buffer.from(rootHash, 'hex');
+      const embed = bitcoin.payments.embed({ data: [data] });
+      txb.addOutput(embed.output, 0);
+      txb.sign(0, this.bitcoinKeyPair);
+      const tx = txb.build();
+      console.log('Bitcoin Settlement TX (hex):', tx.toHex());
+      io.emit('settlementUpdate', { chain: 'bitcoin', status: 'built', txHex: tx.toHex() });
+      // In production, broadcast the transaction via a Bitcoin node/API.
+    } catch (error) {
+      console.error('Error settling on Bitcoin:', error);
+      io.emit('settlementUpdate', { chain: 'bitcoin', status: 'error', error: error.message });
+    }
+  }
+}
+
+/**
+ * MerkleTree constructs a Merkle tree from transaction data,
+ * and provides proof generation and verification methods.
+ */
+class MerkleTree {
+  constructor(transactions) {
+    this.transactions = transactions;
+    this.leaves = transactions.map(tx => this.hash(JSON.stringify(tx)));
+    this.root = this.buildTree(this.leaves);
+  }
+
+  hash(data) {
+    return crypto.createHash('sha256').update(data).digest('hex');
+  }
+
+  buildTree(leaves) {
+    if (leaves.length === 0) return null;
+    let layer = leaves;
+    while (layer.length > 1) {
+      let nextLayer = [];
+      for (let i = 0; i < layer.length; i += 2) {
+        const left = layer[i];
+        const right = i + 1 < layer.length ? layer[i + 1] : left;
+        nextLayer.push(this.hash(left + right));
+      }
+      layer = nextLayer;
+    }
+    return layer[0];
+  }
+
+  getRoot() {
+    return this.root;
+  }
+
+  getProof(leaf) {
+    let index = this.leaves.indexOf(leaf);
+    if (index === -1) return null;
+    let proof = [];
+    let layer = this.leaves.slice();
+    while (layer.length > 1) {
+      let nextLayer = [];
+      for (let i = 0; i < layer.length; i += 2) {
+        const left = layer[i];
+        const right = i + 1 < layer.length ? layer[i + 1] : left;
+        if (i === index || i + 1 === index) {
+          proof.push(i === index ? right : left);
+        }
+        nextLayer.push(this.hash(left + right));
+      }
+      index = Math.floor(index / 2);
+      layer = nextLayer;
+    }
+    return proof;
+  }
+
+  verifyProof(leaf, proof, root) {
+    let computedHash = leaf;
+    for (let sibling of proof) {
+      computedHash = this.hash(computedHash + sibling);
+    }
+    return computedHash === root;
+  }
+}
+
+/**
+ * ExecutionLayer simulates off-chain transaction execution,
+ * supports batching, fraud prevention, and optional code transparency.
+ */
+class ExecutionLayer {
+  constructor(batchSize = 10) {
+    this.transactions = [];
+    this.batchSize = batchSize;
+    this.settlementManager = new SettlementManager();
+    this.settlementMode = process.env.SETTLEMENT_MODE || 'both';
+  }
+
+  async executeTransaction(tx, overrideSettlementMode) {
+    if (!this.fraudCheck(tx)) {
+      console.error('Transaction failed fraud check:', tx);
+      io.emit('transactionError', { tx, error: 'Fraud check failed' });
+      throw new Error('Fraud check failed');
+    }
+    this.transactions.push(tx);
+    console.log(`Executed: ${JSON.stringify(tx)}`);
+    io.emit('transactionExecuted', tx);
+    if (overrideSettlementMode) {
+      this.settlementMode = overrideSettlementMode;
+    }
+    if (this.transactions.length >= this.batchSize) {
+      await this.settleBatch();
+    }
+  }
+
+  fraudCheck(tx) {
+    if (!tx.from || !tx.to || typeof tx.amount !== 'number') return false;
+    if (tx.code && (typeof tx.code !== 'string' || tx.code.trim() === '')) return false;
+    return true;
+  }
+
+  async settleBatch() {
+    if (this.transactions.length === 0) return;
+    const merkleTree = new MerkleTree(this.transactions);
+    const root = merkleTree.getRoot();
+    console.log('Batch Merkle Root:', root);
+    io.emit('batchCreated', { merkleRoot: root, transactions: this.transactions, settlementMode: this.settlementMode });
+
+    // Verify each transaction's inclusion via its Merkle proof.
+    for (const tx of this.transactions) {
+      const leaf = merkleTree.hash(JSON.stringify(tx));
+      const proof = merkleTree.getProof(leaf);
+      const isValid = merkleTree.verifyProof(leaf, proof, root);
+      if (!isValid) {
+        console.error('Fraudulent transaction detected:', tx);
+        io.emit('fraudAlert', tx);
+        throw new Error('Fraudulent transaction detected');
+      }
+    }
+
+    // Settle based on the configured settlement mode.
+    switch (this.settlementMode.toLowerCase()) {
+      case 'ethereum':
+        await this.settlementManager.settleOnEthereum(root);
+        break;
+      case 'bitcoin':
+        await this.settlementManager.settleOnBitcoin(root);
+        break;
+      case 'both':
+      default:
+        await Promise.all([
+          this.settlementManager.settleOnEthereum(root),
+          this.settlementManager.settleOnBitcoin(root)
+        ]);
+        break;
+    }
+    io.emit('batchSettled', { merkleRoot: root, settlementMode: this.settlementMode });
+    this.transactions = [];
+  }
+}
+
+// Global ExecutionLayer instance.
+const executionLayer = new ExecutionLayer(parseInt(process.env.BATCH_SIZE) || 10);
+
+/**
+ * Express API Endpoints
+ */
+app.post('/api/transactions', async (req, res) => {
+  try {
+    const tx = req.body;
+    const settlementMode = req.body.settlementMode; // Optional override.
+    await executionLayer.executeTransaction(tx, settlementMode);
+    res.status(200).json({ status: 'Transaction accepted', tx });
+  } catch (error) {
+    console.error('Error processing transaction:', error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post('/api/settle', async (req, res) => {
+  try {
+    await executionLayer.settleBatch();
+    res.status(200).json({ status: 'Batch settlement triggered' });
+  } catch (error) {
+    console.error('Error during settlement:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/merkle-proof', (req, res) => {
+  try {
+    const { txData } = req.query;
+    if (!txData) {
+      res.status(400).json({ error: 'txData query parameter is required' });
+      return;
+    }
+    const tx = JSON.parse(txData);
+    const merkleTree = new MerkleTree(executionLayer.transactions);
+    const leaf = merkleTree.hash(JSON.stringify(tx));
+    const proof = merkleTree.getProof(leaf);
+    res.status(200).json({ tx, proof, merkleRoot: merkleTree.getRoot() });
+  } catch (error) {
+    console.error('Error generating Merkle proof:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Serve the dashboard page.
+app.get('/dashboard', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// Start the server.
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`API server and Dashboard listening on port ${PORT}`);
+});
+
+// Socket.io connection handling.
+io.on('connection', (socket) => {
+  console.log('Dashboard client connected:', socket.id);
+  socket.emit('dashboardInit', {
+    settlementMode: executionLayer.settlementMode,
+    batchSize: executionLayer.batchSize,
+    currentTransactions: executionLayer.transactions,
+  });
+
+  socket.on('disconnect', () => {
+    console.log('Dashboard client disconnected:', socket.id);
+  });
+});
+const socket = io();
+
+// Initialize dashboard with system info.
+socket.on('dashboardInit', (data) => {
+  document.getElementById('settlementMode').innerText = `Settlement Mode: ${data.settlementMode}`;
+  document.getElementById('batchSize').innerText = `Batch Size: ${data.batchSize}`;
+  updateTransactionList(data.currentTransactions);
+});
+
+// Update dashboard events.
+socket.on('transactionExecuted', (tx) => {
+  addEvent(`Transaction executed: ${JSON.stringify(tx)}`);
+  updateTransactionList();
+});
+
+socket.on('batchCreated', (data) => {
+  addEvent(`Batch created with Merkle Root: ${data.merkleRoot}`);
+  updateTransactionList(data.transactions);
+});
+
+socket.on('batchSettled', (data) => {
+  addEvent(`Batch settled on ${data.settlementMode} with Merkle Root: ${data.merkleRoot}`);
+  updateTransactionList([]);
+});
+
+socket.on('settlementUpdate', (data) => {
+  addEvent(`Settlement update on ${data.chain}: ${data.status}${data.txHash ? ' - TX: ' + data.txHash : ''}`);
+});
+
+socket.on('transactionError', (data) => {
+  addEvent(`Transaction error: ${data.error}`);
+});
+
+socket.on('fraudAlert', (tx) => {
+  addEvent(`Fraud alert for transaction: ${JSON.stringify(tx)}`);
+});
+
+function updateTransactionList(transactions) {
+  const listEl = document.getElementById('transactionList');
+  if (transactions) {
+    listEl.innerHTML = '';
+    transactions.forEach(tx => {
+      const li = document.createElement('li');
+      li.innerText = JSON.stringify(tx);
+      listEl.appendChild(li);
+    });
+  } else {
+    // Optionally, you could implement a refresh mechanism via an API call.
+  }
+}
+
+function addEvent(message) {
+  const eventsEl = document.getElementById('events');
+  const li = document.createElement('li');
+  li.innerText = `[${new Date().toLocaleTimeString()}] ${message}`;
+  eventsEl.prepend(li);
+}
+

@@ -1,0 +1,28 @@
+
+# Node.js dependencies
+node_modules/
+package-lock.json
+
+# Logs
+logs/
+*.log
+
+# Environment variables
+.env
+
+# FHE keys (Sensitive Data)
+keys/
+fhe_key.json
+
+# Uploaded files
+uploads/
+
+# Compiled files
+dist/
+build/
+
+# OS-specific & editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
